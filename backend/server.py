@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Redis configuration
-CACHE_EXPIRATION = 36000
+CACHE_EXPIRATION = os.getenv("CACHE_EXPIRATION", 3600)
 DB = 2
 REDIS_HOST = os.getenv("CACHE_HOST", "cache")
 
