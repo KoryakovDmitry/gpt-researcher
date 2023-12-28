@@ -1,58 +1,96 @@
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+import hashlib
 import json
+import logging
 import os
-from gpt_researcher.utils.websocket_manager import WebSocketManager
-from .utils import write_md_to_pdf
+
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from gpt_researcher import GPTResearcher
+
+from redis import Redis
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Set up basic logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Redis configuration
+CACHE_EXPIRATION = 36000
+DB = 2
+REDIS_HOST = os.getenv("CACHE_HOST", "cache")
+
+REDIS_PORT = os.getenv("CACHE_PORT", 6379)
+logger.info(f"{REDIS_HOST}, {REDIS_PORT}")
+
+redis_client = Redis(host=REDIS_HOST, port=REDIS_PORT, db=DB)
 
 
-class ResearchRequest(BaseModel):
-    task: str
-    report_type: str
-    agent: str
+def hash_string(
+    input_string,
+    algorithm="md5",
+):
+    """
+    Hashes an input string using the specified algorithm.
+
+    :param input_string: The string to be hashed.
+    :param algorithm: The hashing algorithm to use (default is 'sha256').
+    :return: The hexadecimal hash of the input string.
+    """
+    # Create a new hash object using the specified algorithm
+    hash_object = hashlib.new(algorithm)
+
+    # Update the hash object with the bytes of the input string
+    hash_object.update(input_string.encode())
+
+    # Return the hexadecimal representation of the hash
+    return hash_object.hexdigest()
+
+
+def cache_data(cache_name, data):
+    redis_client.set(cache_name, json.dumps(data), ex=CACHE_EXPIRATION)
+
+
+def get_cached_data(cache_name):
+    cached_data = redis_client.get(cache_name)
+    return json.loads(cached_data) if cached_data else None
 
 
 app = FastAPI()
 
-app.mount("/site", StaticFiles(directory="./frontend"), name="site")
-app.mount("/static", StaticFiles(directory="./frontend/static"), name="static")
 
-templates = Jinja2Templates(directory="./frontend")
-
-manager = WebSocketManager()
+class ReportRequest(BaseModel):
+    query: str
+    report_type: str = "research_report"
 
 
-# Dynamic directory for outputs once first research is run
-@app.on_event("startup")
-def startup_event():
-    if not os.path.isdir("outputs"):
-        os.makedirs("outputs")
-    app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
+@app.post("/generate_report")
+async def generate_report(
+    request: ReportRequest,
+    no_cache: bool = False,
+):
+    """
+    Endpoint to generate a research report based on the given query.
+    """
+    query = request.query
+    report_type = request.report_type
+    search_key = hash_string(f"data_{query}_{report_type}")
 
-@app.get("/")
-async def read_root(request: Request):
-    return templates.TemplateResponse('index.html', {"request": request, "report": None})
+    if not no_cache:
+        cached = get_cached_data(search_key)
+        if cached:
+            logger.info("Found result in cache: %s", search_key)
+            return cached
 
+    # Initialize the GPT Researcher
+    researcher = GPTResearcher(query=query, report_type=report_type, config_path=None)
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
-    try:
-        while True:
-            data = await websocket.receive_text()
-            if data.startswith("start"):
-                json_data = json.loads(data[6:])
-                task = json_data.get("task")
-                report_type = json_data.get("report_type")
-                if task and report_type:
-                    report = await manager.start_streaming(task, report_type, websocket)
-                    path = await write_md_to_pdf(report)
-                    await websocket.send_json({"type": "path", "output": path})
-                else:
-                    print("Error: not enough parameters provided.")
+    # Run Research and get the report
+    report = await researcher.run()
 
-    except WebSocketDisconnect:
-        await manager.disconnect(websocket)
+    if not no_cache:
+        cache_data(search_key, {"data": report})
+        logger.info("Cached result data: %s", search_key)
 
+    return {"data": report}
