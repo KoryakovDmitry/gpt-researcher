@@ -20,6 +20,7 @@ WORKDIR /usr/src/app
 
 COPY ./requirements.txt ./requirements.txt
 RUN pip install -r requirements.txt
+RUN pip install -U langchain-community
 
 FROM gpt-researcher-install AS gpt-researcher
 
